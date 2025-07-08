@@ -1,0 +1,418 @@
+"use strict";
+// This file exists to help normalize process.env amongst the backend
+// and frontend.  Many frontends (eg. Next, CRA) utilize webpack's DefinePlugin
+// along with prefixes, meaning we have to explicitly use the full `process.env.FOO`
+// string in order to read variables.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.parseAsBoolean = exports.getResponse = exports.getFetch = exports.platformSupportsStreaming = exports.getPlatformName = exports.inngestHeaders = exports.allProcessEnv = exports.processEnv = exports.getEnvironmentName = exports.getMode = exports.Mode = exports.devServerHost = void 0;
+const version_js_1 = require("../version.js");
+const consts_js_1 = require("./consts.js");
+const strings_js_1 = require("./strings.js");
+/**
+ * devServerHost returns the dev server host by searching for the INNGEST_DEVSERVER_URL
+ * environment variable (plus project prefixces for eg. react, such as REACT_APP_INNGEST_DEVSERVER_URL).
+ *
+ * If not found this returns undefined, indicating that the env var has not been set.
+ *
+ * @example devServerHost()
+ */
+const devServerHost = (env = (0, exports.allProcessEnv)()) => {
+    // devServerKeys are the env keys we search for to discover the dev server
+    // URL.  This includes the standard key first, then includes prefixed keys
+    // for use within common frameworks (eg. CRA, next).
+    //
+    // We have to fully write these using process.env as they're typically
+    // processed using webpack's DefinePlugin, which is dumb and does a straight
+    // text replacement instead of actually understanding the AST, despite webpack
+    // being fully capable of understanding the AST.
+    const prefixes = ["REACT_APP_", "NEXT_PUBLIC_"];
+    const keys = [consts_js_1.envKeys.InngestBaseUrl, consts_js_1.envKeys.InngestDevMode];
+    const values = keys.flatMap((key) => {
+        return prefixes.map((prefix) => {
+            return env[prefix + key];
+        });
+    });
+    return values.find((v) => {
+        if (!v) {
+            return;
+        }
+        try {
+            return Boolean(new URL(v));
+        }
+        catch (_a) {
+            // no-op
+        }
+    });
+};
+exports.devServerHost = devServerHost;
+const checkFns = ((checks) => checks)({
+    equals: (actual, expected) => actual === expected,
+    "starts with": (actual, expected) => { var _a; return expected ? (_a = actual === null || actual === void 0 ? void 0 : actual.startsWith(expected)) !== null && _a !== void 0 ? _a : false : false; },
+    "is truthy": (actual) => Boolean(actual),
+    "is truthy but not": (actual, expected) => Boolean(actual) && actual !== expected,
+});
+const prodChecks = [
+    ["CF_PAGES", "equals", "1"],
+    ["CONTEXT", "starts with", "prod"],
+    ["ENVIRONMENT", "starts with", "prod"],
+    ["NODE_ENV", "starts with", "prod"],
+    ["VERCEL_ENV", "starts with", "prod"],
+    ["DENO_DEPLOYMENT_ID", "is truthy"],
+    [consts_js_1.envKeys.VercelEnvKey, "is truthy but not", "development"],
+    [consts_js_1.envKeys.IsNetlify, "is truthy"],
+    [consts_js_1.envKeys.IsRender, "is truthy"],
+    [consts_js_1.envKeys.RailwayBranch, "is truthy"],
+    [consts_js_1.envKeys.IsCloudflarePages, "is truthy"],
+];
+class Mode {
+    constructor({ type, isExplicit, explicitDevUrl, env = (0, exports.allProcessEnv)(), }) {
+        this.env = env;
+        this.type = type;
+        this.isExplicit = isExplicit || Boolean(explicitDevUrl);
+        this.explicitDevUrl = explicitDevUrl;
+    }
+    get isDev() {
+        return this.type === "dev";
+    }
+    get isCloud() {
+        return this.type === "cloud";
+    }
+    get isInferred() {
+        return !this.isExplicit;
+    }
+    /**
+     * If we are explicitly in a particular mode, retrieve the URL that we are
+     * sure we should be using, not considering any environment variables or other
+     * influences.
+     */
+    getExplicitUrl(defaultCloudUrl) {
+        if (!this.isExplicit) {
+            return undefined;
+        }
+        if (this.explicitDevUrl) {
+            return this.explicitDevUrl.href;
+        }
+        if (this.isCloud) {
+            return defaultCloudUrl;
+        }
+        if (this.isDev) {
+            return consts_js_1.defaultDevServerHost;
+        }
+        return undefined;
+    }
+}
+exports.Mode = Mode;
+/**
+ * Returns the mode of the current environment, based off of either passed
+ * environment variables or `process.env`, or explicit settings.
+ */
+const getMode = ({ env = (0, exports.allProcessEnv)(), client, explicitMode, } = {}) => {
+    if (explicitMode) {
+        return new Mode({ type: explicitMode, isExplicit: true, env });
+    }
+    if (client === null || client === void 0 ? void 0 : client["mode"].isExplicit) {
+        return client["mode"];
+    }
+    if (consts_js_1.envKeys.InngestDevMode in env) {
+        if (typeof env[consts_js_1.envKeys.InngestDevMode] === "string") {
+            try {
+                const explicitDevUrl = new URL(env[consts_js_1.envKeys.InngestDevMode]);
+                return new Mode({ type: "dev", isExplicit: true, explicitDevUrl, env });
+            }
+            catch (_a) {
+                // no-op
+            }
+        }
+        const envIsDev = (0, exports.parseAsBoolean)(env[consts_js_1.envKeys.InngestDevMode]);
+        if (typeof envIsDev === "boolean") {
+            return new Mode({
+                type: envIsDev ? "dev" : "cloud",
+                isExplicit: true,
+                env,
+            });
+        }
+    }
+    const isProd = prodChecks.some(([key, checkKey, expected]) => {
+        return checkFns[checkKey]((0, strings_js_1.stringifyUnknown)(env[key]), expected);
+    });
+    return new Mode({ type: isProd ? "cloud" : "dev", isExplicit: false, env });
+};
+exports.getMode = getMode;
+/**
+ * getEnvironmentName returns the suspected branch name for this environment by
+ * searching through a set of common environment variables.
+ *
+ * This could be used to determine if we're on a branch deploy or not, though it
+ * should be noted that we don't know if this is the default branch or not.
+ */
+const getEnvironmentName = (env = (0, exports.allProcessEnv)()) => {
+    /**
+     * Order is important; more than one of these env vars may be set, so ensure
+     * that we check the most specific, most reliable env vars first.
+     */
+    return (env[consts_js_1.envKeys.InngestEnvironment] ||
+        env[consts_js_1.envKeys.BranchName] ||
+        env[consts_js_1.envKeys.VercelBranch] ||
+        env[consts_js_1.envKeys.NetlifyBranch] ||
+        env[consts_js_1.envKeys.CloudflarePagesBranch] ||
+        env[consts_js_1.envKeys.RenderBranch] ||
+        env[consts_js_1.envKeys.RailwayBranch]);
+};
+exports.getEnvironmentName = getEnvironmentName;
+const processEnv = (key) => {
+    return (0, exports.allProcessEnv)()[key];
+};
+exports.processEnv = processEnv;
+/**
+ * allProcessEnv returns the current process environment variables, or an empty
+ * object if they cannot be read, making sure we support environments other than
+ * Node such as Deno, too.
+ *
+ * Using this ensures we don't dangerously access `process.env` in environments
+ * where it may not be defined, such as Deno or the browser.
+ */
+const allProcessEnv = () => {
+    // Node, or Node-like environments
+    try {
+        // eslint-disable-next-line @inngest/internal/process-warn
+        if (process.env) {
+            // eslint-disable-next-line @inngest/internal/process-warn
+            return process.env;
+        }
+    }
+    catch (_err) {
+        // noop
+    }
+    // Deno
+    try {
+        const env = Deno.env.toObject();
+        if (env) {
+            return env;
+        }
+    }
+    catch (_err) {
+        // noop
+    }
+    // Netlify
+    try {
+        const env = Netlify.env.toObject();
+        if (env) {
+            return env;
+        }
+    }
+    catch (_err) {
+        // noop
+    }
+    return {};
+};
+exports.allProcessEnv = allProcessEnv;
+/**
+ * Generate a standardised set of headers based on input and environment
+ * variables.
+ *
+ *
+ */
+const inngestHeaders = (opts) => {
+    var _a;
+    const sdkVersion = `inngest-js:v${version_js_1.version}`;
+    const headers = {
+        "Content-Type": "application/json",
+        "User-Agent": sdkVersion,
+        [consts_js_1.headerKeys.SdkVersion]: sdkVersion,
+    };
+    if (opts === null || opts === void 0 ? void 0 : opts.framework) {
+        headers[consts_js_1.headerKeys.Framework] = opts.framework;
+    }
+    if (opts === null || opts === void 0 ? void 0 : opts.expectedServerKind) {
+        headers[consts_js_1.headerKeys.InngestExpectedServerKind] = opts.expectedServerKind;
+    }
+    const env = Object.assign(Object.assign({}, (0, exports.allProcessEnv)()), opts === null || opts === void 0 ? void 0 : opts.env);
+    const inngestEnv = (opts === null || opts === void 0 ? void 0 : opts.inngestEnv) || (0, exports.getEnvironmentName)(env);
+    if (inngestEnv) {
+        headers[consts_js_1.headerKeys.Environment] = inngestEnv;
+    }
+    const platform = (0, exports.getPlatformName)(env);
+    if (platform) {
+        headers[consts_js_1.headerKeys.Platform] = platform;
+    }
+    return Object.assign(Object.assign(Object.assign({}, headers), (_a = opts === null || opts === void 0 ? void 0 : opts.client) === null || _a === void 0 ? void 0 : _a["headers"]), opts === null || opts === void 0 ? void 0 : opts.extras);
+};
+exports.inngestHeaders = inngestHeaders;
+/**
+ * A set of checks that, given an environment, will return `true` if the current
+ * environment is running on the platform with the given name.
+ */
+const platformChecks = {
+    /**
+     * Vercel Edge Functions don't have access to environment variables unless
+     * they are explicitly referenced in the top level code, but they do have a
+     * global `EdgeRuntime` variable set that we can use to detect this.
+     */
+    vercel: (env) => env[consts_js_1.envKeys.IsVercel] === "1" || typeof EdgeRuntime === "string",
+    netlify: (env) => env[consts_js_1.envKeys.IsNetlify] === "true",
+    "cloudflare-pages": (env) => env[consts_js_1.envKeys.IsCloudflarePages] === "1",
+    render: (env) => env[consts_js_1.envKeys.IsRender] === "true",
+    railway: (env) => Boolean(env[consts_js_1.envKeys.RailwayEnvironment]),
+};
+/**
+ * A set of checks that, given an environment, will return `true` if the current
+ * environment and platform supports streaming responses back to Inngest.
+ *
+ * Streaming capability is both framework and platform-based. Frameworks are
+ * supported in serve handlers, and platforms are checked here.
+ *
+ * As such, this record declares which platforms we explicitly support for
+ * streaming and is used by {@link platformSupportsStreaming}.
+ */
+const streamingChecks = {
+    /**
+     * "Vercel supports streaming for Serverless Functions, Edge Functions, and
+     * React Server Components in Next.js projects."
+     *
+     * In practice, however, there are many reports of streaming not working as
+     * expected on Serverless Functions, so we resort to only allowing streaming
+     * for Edge Functions here.
+     *
+     * See {@link https://vercel.com/docs/frameworks/nextjs#streaming}
+     */
+    vercel: (_framework, _env) => typeof EdgeRuntime === "string",
+    "cloudflare-pages": () => true,
+};
+const getPlatformName = (env) => {
+    return Object.keys(platformChecks).find((key) => {
+        return platformChecks[key](env);
+    });
+};
+exports.getPlatformName = getPlatformName;
+/**
+ * Returns `true` if we believe the current environment supports streaming
+ * responses back to Inngest.
+ *
+ * We run a check directly related to the platform we believe we're running on,
+ * usually based on environment variables.
+ */
+const platformSupportsStreaming = (framework, env = (0, exports.allProcessEnv)()) => {
+    var _a, _b;
+    return ((_b = (_a = streamingChecks[(0, exports.getPlatformName)(env)]) === null || _a === void 0 ? void 0 : _a.call(streamingChecks, framework, env)) !== null && _b !== void 0 ? _b : false);
+};
+exports.platformSupportsStreaming = platformSupportsStreaming;
+/**
+ * A unique symbol used to mark a custom fetch implementation. We wrap the
+ * implementations to provide some extra control when handling errors.
+ */
+const CUSTOM_FETCH_MARKER = Symbol("Custom fetch implementation");
+/**
+ * Given a potential fetch function, return the fetch function to use based on
+ * this and the environment.
+ */
+const getFetch = (givenFetch) => {
+    /**
+     * If we've explicitly been given a fetch function, use that.
+     */
+    if (givenFetch) {
+        if (CUSTOM_FETCH_MARKER in givenFetch) {
+            return givenFetch;
+        }
+        /**
+         * We wrap the given fetch function to provide some extra control when
+         * handling errors.
+         */
+        const customFetch = async (...args) => {
+            var _a;
+            try {
+                return await givenFetch(...args);
+            }
+            catch (err) {
+                /**
+                 * Capture warnings that are not simple fetch failures and highlight
+                 * them for the user.
+                 *
+                 * We also use this opportunity to log the causing error, as code higher
+                 * up the stack will likely abstract this.
+                 */
+                if (!(err instanceof Error) ||
+                    !((_a = err.message) === null || _a === void 0 ? void 0 : _a.startsWith("fetch failed"))) {
+                    console.warn("A request failed when using a custom fetch implementation; this may be a misconfiguration. Make sure that your fetch client is correctly bound to the global scope.");
+                    console.error(err);
+                }
+                throw err;
+            }
+        };
+        /**
+         * Mark the custom fetch implementation so that we can identify it later, in
+         * addition to adding some runtime properties to it to make it seem as much
+         * like the original fetch as possible.
+         */
+        Object.defineProperties(customFetch, {
+            [CUSTOM_FETCH_MARKER]: {},
+            name: { value: givenFetch.name },
+            length: { value: givenFetch.length },
+        });
+        return customFetch;
+    }
+    /**
+     * Browser or Node 18+
+     */
+    try {
+        if (typeof globalThis !== "undefined" && "fetch" in globalThis) {
+            return fetch.bind(globalThis);
+        }
+    }
+    catch (err) {
+        // no-op
+    }
+    /**
+     * Existing polyfilled fetch
+     */
+    if (typeof fetch !== "undefined") {
+        return fetch;
+    }
+    /**
+     * Environments where fetch cannot be found and must be polyfilled
+     */
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require("cross-fetch");
+};
+exports.getFetch = getFetch;
+/**
+ * If `Response` isn't included in this environment, it's probably an earlier
+ * Node env that isn't already polyfilling. This function returns either the
+ * native `Response` or a polyfilled one.
+ */
+const getResponse = () => {
+    if (typeof Response !== "undefined") {
+        return Response;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-var-requires
+    return require("cross-fetch").Response;
+};
+exports.getResponse = getResponse;
+/**
+ * Given an unknown value, try to parse it as a `boolean`. Useful for parsing
+ * environment variables that could be a selection of different values such as
+ * `"true"`, `"1"`.
+ *
+ * If the value could not be confidently parsed as a `boolean` or was seen to be
+ * `undefined`, this function returns `undefined`.
+ */
+const parseAsBoolean = (value) => {
+    if (typeof value === "boolean") {
+        return value;
+    }
+    if (typeof value === "number") {
+        return Boolean(value);
+    }
+    if (typeof value === "string") {
+        const trimmed = value.trim().toLowerCase();
+        if (trimmed === "undefined") {
+            return undefined;
+        }
+        if (["true", "1"].includes(trimmed)) {
+            return true;
+        }
+        return false;
+    }
+    return undefined;
+};
+exports.parseAsBoolean = parseAsBoolean;
+//# sourceMappingURL=env.js.map
