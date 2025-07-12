@@ -1,3 +1,4 @@
+const { inngest } = require("../inngest")
 const Booking = require("../models/Booking")
 const Show = require("../models/Show")
 const {Stripe} = require('stripe')
@@ -79,6 +80,14 @@ const createBooking = async (req, res) => {
 
         booking.paymentLink = session.url
         await booking.save()
+
+        //run Inngest function to check payment after 3 hours
+        await inngest.send({
+            name:"app/checkpayment",
+            data: {
+                bookingId: booking._id.toString()
+            }
+        })
         
         res.json({success: true, url: session.url})
 
