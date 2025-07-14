@@ -9,7 +9,7 @@ const stripewebhooks = async (request, response) => {
     let event;
     try {
         event = stripeInstance.webhooks.constructEvent(request.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-        console.log(`Received event: ${event.type}`);  // Added logging
+        console.log(`Received event: ${event.type}`);  
     } catch(error) {
         console.error('Webhook signature verification failed:', error);
         return response.status(400).send(`Webhook Error: ${error.message}`);
@@ -19,49 +19,17 @@ const stripewebhooks = async (request, response) => {
         switch (event.type) {
             case "payment_intent.succeeded": {
                 const paymentIntent = event.data.object;
-                console.log('PaymentIntent:', paymentIntent.id);
-                
-                // Retrieve the checkout session
                 const sessionList = await stripeInstance.checkout.sessions.list({
                     payment_intent: paymentIntent.id,
-                    limit: 1
                 });
 
-                if (!sessionList.data || sessionList.data.length === 0) {
-                    console.error('No checkout session found for payment intent:', paymentIntent.id);
-                    return response.status(400).send('No checkout session found');
-                }
+                const session = sessionList.data[0]
+                const { bookingId } = session.metadata
 
-                const session = sessionList.data[0];
-                console.log('Checkout session:', session.id);
-                
-                if (!session.metadata || !session.metadata.bookingId) {
-                    console.error('No bookingId in session metadata');
-                    return response.status(400).send('No bookingId in metadata');
-                }
-
-                const { bookingId } = session.metadata;
-                console.log('Updating booking:', bookingId);
-
-                // Update the booking
-                const updatedBooking = await Booking.findByIdAndUpdate(
-                    bookingId,
-                    { isPaid: true, paymentLink: "" },
-                    { new: true }  // Return the updated document
-                );
-
-                if (!updatedBooking) {
-                    console.error('Booking not found:', bookingId);
-                    return response.status(404).send('Booking not found');
-                }
-
-                console.log('Booking updated successfully:', updatedBooking._id);
-
-                // Send confirmation email
-                await inngest.send({
-                    name: "app/show.booked",
-                    data: { bookingId }
-                });
+                await Booking.findByIdAndUpdate(bookingId, {
+                    isPaid: true,
+                    paymentLink: ""
+                })
 
                 break;
             }
